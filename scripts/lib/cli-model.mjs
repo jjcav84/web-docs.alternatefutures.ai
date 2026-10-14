@@ -12,6 +12,12 @@
  *   const env = cmd.command('env')             → child of services, bound to `env`
  *   env.command('list [service]')              → child of env  ⇒ acc services env list
  *
+ * A registration inside `for (const op of ['a', 'b'] as const) { … }` whose
+ * signature is a template literal over that variable, as in
+ * archives.command(`${op} <archive-id>`) (cli#163), expands to one node per
+ * value: `.description({ a: '…', b: '…' }[op])` gives each its own text and
+ * an `if (op !== 'b') { ….option(…) }` guard keeps that option off `b`.
+ *
  * CLI repo location:
  *   - AF_CLI_REPO env var, else
  *   - ../alternate-clouds-cli (local sibling checkout), else
@@ -28,6 +34,14 @@ export const GROUPS = [
     dirs: ['projects', 'services', 'deployments', 'regions', 'templates', 'ssh', 'cp', 'attest'],
   },
   { title: 'Chat', dirs: ['chat'] },
+  // Archives mirrors `{ title: 'Archives', names: ['archives'] }` in the CLI's
+  // COMMAND_GROUPS (cli#163, acc 1.10.0). The platform refuses uploads so far
+  // (`acc archives capabilities` answers `available: false`), so the group
+  // stays off the public page until the feature is switched on. The global
+  // DOCS_INCLUDE_UNRELEASED_SURFACES flag has been 1 in CI since the swarm
+  // launch and hides nothing on its own, so this group carries its own gate:
+  // DOCS_INCLUDE_ARCHIVES=1 renders it (AF_DOCS_PIPELINE.md §4).
+  { title: 'Archives', dirs: ['archives'], unreleased: true, gate: 'DOCS_INCLUDE_ARCHIVES' },
   // Swarm groups mirror COMMAND_GROUPS in the CLI's src/cli.ts (2026-09-21
   // split: the normal path, the advanced commands, identity). These modules
   // register top-level commands, so each group is matched by command name.
@@ -109,40 +123,183 @@ function receiverAt(content, idx) {
   return { receiver, assigned: am ? am[1] : null };
 }
 
+/** Index of the quote closing the string that opens at `i` (' or "), or -1. */
+function skipQuoted(content, i) {
+  const quote = content[i];
+  for (i++; i < content.length; i++) {
+    if (content[i] === '\\') i++;
+    else if (content[i] === quote || content[i] === '\n') return i;
+  }
+  return -1;
+}
+
+/** Index of the backtick closing the template literal that opens at `i`, or -1. */
+function skipTemplate(content, i) {
+  for (i++; i < content.length; i++) {
+    if (content[i] === '\\') i++;
+    else if (content[i] === '`') return i;
+    else if (content[i] === '$' && content[i + 1] === '{') {
+      i = matchBrace(content, i + 1);
+      if (i === -1) return -1;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Index of the `}` matching the `{` at `open`, or -1. Strings, template
+ * literals and comments are skipped. Regex literals are not recognised, so a
+ * regex holding a quote or an unbalanced brace inside the block can defeat
+ * the match; callers then fall back to the unexpanded registration.
+ */
+function matchBrace(content, open) {
+  let depth = 0;
+  for (let i = open; i < content.length; i++) {
+    const ch = content[i];
+    const next = content[i + 1];
+    if (ch === '/' && next === '/') {
+      i = content.indexOf('\n', i);
+      if (i === -1) return -1;
+    } else if (ch === '/' && next === '*') {
+      i = content.indexOf('*/', i + 2);
+      if (i === -1) return -1;
+      i++;
+    } else if (ch === "'" || ch === '"') {
+      i = skipQuoted(content, i);
+      if (i === -1) return -1;
+    } else if (ch === '`') {
+      i = skipTemplate(content, i);
+      if (i === -1) return -1;
+    } else if (ch === '{') {
+      depth++;
+    } else if (ch === '}' && --depth === 0) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+/** STR with its backreference renumbered so it can sit after `group - 1` capture groups. */
+const strAt = (group) => STR.replace(/\\1/g, `\\${group}`);
+
+const LOOP_RE = /\bfor\s*\(\s*(?:const|let)\s+([A-Za-z_$][\w$]*)\s+of\s+\[([^\]]*)\]\s*(?:as\s+const\s*)?\)\s*\{/g;
+
+/**
+ * String values of the innermost `for (const name of ['a', 'b'] as const) { … }`
+ * whose body holds `idx`, or null when no such loop binds `name`.
+ */
+function loopValues(content, idx, name) {
+  let found = null;
+  for (const m of content.matchAll(LOOP_RE)) {
+    if (m[1] !== name) continue;
+    const open = m.index + m[0].length - 1;
+    if (open > idx) break;
+    const close = matchBrace(content, open);
+    if (close === -1 || close < idx) continue;
+    const values = [...m[2].matchAll(new RegExp(STR, 'g'))].map((s) => s[2]);
+    if (values.length > 0) found = values; // a later match is an inner loop
+  }
+  return found;
+}
+
+/**
+ * `.description({ a: '…', b: '…' }[name])` in `seg`: value → description, or
+ * null when the description is not such a lookup.
+ */
+function lookupDescriptions(seg, name) {
+  const at = seg.search(/\.description\(\s*\{/);
+  if (at === -1) return null;
+  const open = seg.indexOf('{', at);
+  const close = matchBrace(seg, open);
+  if (close === -1 || !new RegExp(`^\\s*\\[\\s*${name}\\s*\\]`).test(seg.slice(close + 1))) return null;
+  const entryRe = new RegExp(`(?:([A-Za-z_$][\\w$]*)|${strAt(2)})\\s*:\\s*${strAt(4)}`, 'g');
+  const map = {};
+  for (const e of seg.slice(open + 1, close).matchAll(entryRe)) map[e[1] ?? e[3]] = e[5];
+  return map;
+}
+
+/**
+ * `seg` without the `if (name === 'x') { … }` / `if (name !== 'x') { … }`
+ * blocks that do not run for `value`, so their `.option(` calls are not
+ * attributed to it.
+ */
+function applyGuards(seg, name, value) {
+  const guardRe = new RegExp(`\\bif\\s*\\(\\s*${name}\\s*([!=]==?)\\s*${strAt(2)}\\s*\\)\\s*\\{`, 'g');
+  let out = '';
+  let last = 0;
+  for (const g of seg.matchAll(guardRe)) {
+    if (g.index < last) continue;
+    const open = g.index + g[0].length - 1;
+    const close = matchBrace(seg, open);
+    if (close === -1) break;
+    const runs = (g[3] === value) === g[1].startsWith('=');
+    if (!runs) {
+      out += seg.slice(last, g.index);
+      last = close + 1;
+    }
+  }
+  return out + seg.slice(last);
+}
+
+/**
+ * The registrations a `.command(` hit stands for: one per loop value when the
+ * signature is a template literal over a variable bound by an enclosing
+ * `for … of […]` loop, else the hit itself, untouched.
+ */
+function expandLoop(content, hit, seg) {
+  const plain = [{ signature: hit.signature, seg, description: undefined }];
+  if (hit.quote !== '`') return plain;
+  const holes = [...new Set([...hit.signature.matchAll(/\$\{\s*([A-Za-z_$][\w$]*)\s*\}/g)].map((h) => h[1]))];
+  if (holes.length !== 1) return plain;
+  const name = holes[0];
+  const values = loopValues(content, hit.start, name);
+  if (!values) return plain;
+  const descriptions = lookupDescriptions(seg, name) ?? {};
+  const holeRe = new RegExp(`\\$\\{\\s*${name}\\s*\\}`, 'g');
+  return values.map((value) => ({
+    signature: hit.signature.replace(holeRe, value),
+    seg: applyGuards(seg, name, value),
+    description: descriptions[value],
+  }));
+}
+
 /** Every `.command('…')` in a file with its description, options, receiver and assigned variable. */
 function parseRegistrations(content, fileLabel, en) {
   const cmdRe = new RegExp(`\\.command\\(\\s*${STR}`, 'g');
   const hits = [];
   let m;
-  while ((m = cmdRe.exec(content))) hits.push({ signature: m[2], start: m.index });
+  while ((m = cmdRe.exec(content))) hits.push({ signature: m[2], quote: m[1], start: m.index });
   const out = [];
   for (let i = 0; i < hits.length; i++) {
-    const seg = content.slice(hits[i].start, hits[i + 1]?.start ?? content.length);
-    const desc = seg.match(new RegExp(`\\.description\\(\\s*${STR}`));
-    const optRe = new RegExp(
-      `\\.(?:option|requiredOption)\\(\\s*${STR}\\s*,\\s*${STR2}(?:\\s*,\\s*(?:${STR3}|[^)]+))?`,
-      'g',
-    );
-    const options = [...seg.matchAll(optRe)].map((o) => ({
-      flag: o[2],
-      description: o[4],
-      defaultValue: o[6],
-      ...parseFlag(o[2]),
-    }));
-    // Options described with t('key') do not match optRe's string-literal shape.
-    const optTRe = new RegExp(`\\.(?:option|requiredOption)\\(\\s*${STR}\\s*,\\s*${T_CALL.replace(/\\1/g, '\\3')}`, 'g');
-    for (const o of seg.matchAll(optTRe)) {
-      if (!options.some((x) => x.flag === o[2])) {
-        options.push({ flag: o[2], description: en[o[4]] ?? '', defaultValue: undefined, ...parseFlag(o[2]) });
+    const segment = content.slice(hits[i].start, hits[i + 1]?.start ?? content.length);
+    // One registration, or one per value for a `for (const x of […])` loop.
+    for (const { signature, seg, description } of expandLoop(content, hits[i], segment)) {
+      const desc = seg.match(new RegExp(`\\.description\\(\\s*${STR}`));
+      const optRe = new RegExp(
+        `\\.(?:option|requiredOption)\\(\\s*${STR}\\s*,\\s*${STR2}(?:\\s*,\\s*(?:${STR3}|[^)]+))?`,
+        'g',
+      );
+      const options = [...seg.matchAll(optRe)].map((o) => ({
+        flag: o[2],
+        description: o[4],
+        defaultValue: o[6],
+        ...parseFlag(o[2]),
+      }));
+      // Options described with t('key') do not match optRe's string-literal shape.
+      const optTRe = new RegExp(`\\.(?:option|requiredOption)\\(\\s*${STR}\\s*,\\s*${T_CALL.replace(/\\1/g, '\\3')}`, 'g');
+      for (const o of seg.matchAll(optTRe)) {
+        if (!options.some((x) => x.flag === o[2])) {
+          options.push({ flag: o[2], description: en[o[4]] ?? '', defaultValue: undefined, ...parseFlag(o[2]) });
+        }
       }
+      out.push({
+        signature: signature.replace(/\s+/g, ' ').trim(),
+        description: description ?? (desc ? desc[2] : resolveT(seg, 'description', en)),
+        options,
+        file: fileLabel,
+        ...receiverAt(content, hits[i].start),
+      });
     }
-    out.push({
-      signature: hits[i].signature.replace(/\s+/g, ' ').trim(),
-      description: desc ? desc[2] : resolveT(seg, 'description', en),
-      options,
-      file: fileLabel,
-      ...receiverAt(content, hits[i].start),
-    });
   }
   return out;
 }
